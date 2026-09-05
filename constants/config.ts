@@ -53,6 +53,11 @@ export const AppConfig = {
 
   // Database
   DB_NAME: 'face_attendance.db',
+
+  // TFLite Model File Path
+  // Place mobilefacenet.tflite at this path to enable real inference
+  MODEL_ASSET_PATH: 'assets/models/mobilefacenet.tflite',
+  MODEL_AVAILABLE: false, // Set to true after placing model file and verifying metadata
 };
 
 export const AttendanceColumns = [

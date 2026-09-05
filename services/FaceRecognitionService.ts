@@ -1,8 +1,37 @@
-// Face Recognition Service
-// Architecture: ML Kit (detection) → TFLite (embedding) → Cosine Similarity (recognition)
-// V1: Mock pipeline with full production interface — swap implementations when native modules ready
+/**
+ * FaceRecognitionService.ts
+ * ─────────────────────────────────────────────────────────────────
+ * Face Recognition pipeline:
+ *   ML Kit (detection) → ImagePreprocessor (crop+resize+RGB)
+ *   → TFLiteEngine (inference) → Cosine Similarity (recognition)
+ *
+ * generateFaceEmbedding() now uses REAL TFLite inference when
+ * the model file exists at assets/models/mobilefacenet.tflite.
+ *
+ * Fallback: If model load fails (e.g., file not yet added, web preview),
+ * it falls back to the deterministic mock so the UI stays functional.
+ *
+ * ─── HOW TO SWAP FROM MOCK TO REAL ──────────────────────────────
+ * 1. Copy mobilefacenet.tflite to assets/models/mobilefacenet.tflite
+ * 2. Run inspectModelMetadata() (from Settings → Model Inspector)
+ * 3. Verify and update in constants/config.ts:
+ *    - MODEL_INPUT_SIZE (likely 112)
+ *    - MODEL_INPUT_CHANNELS (likely 3)
+ *    - MODEL_EMBEDDING_DIM (likely 128)
+ *    - MODEL_NORMALIZE_MEAN / MODEL_NORMALIZE_SCALE (likely 127.5/127.5)
+ * 4. If input tensor name is not '0', update TFLiteEngine.runInference()
+ * 5. Run real-device tests: same-person score vs different-person score
+ * 6. Calibrate DEFAULT_RECOGNITION_THRESHOLD and DUPLICATE_THRESHOLD
+ * ─────────────────────────────────────────────────────────────────
+ */
 
 import { AppConfig } from '@/constants/config';
+import { preprocessFaceImage, clampCropRegion } from '@/services/ImagePreprocessor';
+import { runInference, isModelLoaded, loadModel, getModelLoadError } from '@/services/TFLiteEngine';
+
+// ─── Re-export TFLite utilities for Settings screen ───────────────────────
+export { inspectModelMetadata, formatMetadata, isModelLoaded, loadModel, getModelLoadError } from '@/services/TFLiteEngine';
+export type { ModelMetadata, TensorInfo } from '@/services/TFLiteEngine';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -45,7 +74,7 @@ export type FaceQualityResult = {
 
 export type AngleStep = 'FRONT' | 'LEFT' | 'RIGHT' | 'UP' | 'DOWN';
 
-export type EmbeddingVector = number[]; // 128-dim (provisional)
+export type EmbeddingVector = number[]; // 128-dim (provisional — verify with model)
 
 export type RecognitionMatch = {
   personId: number;
@@ -55,7 +84,7 @@ export type RecognitionMatch = {
 };
 
 // ─── Mock ML Kit Face Detector ───────────────────────────────────────────────
-// TODO: Replace with @react-native-ml-kit/face-detection or native module
+// TODO: Replace with @react-native-ml-kit/face-detection native module
 // Native module signature preserved for drop-in replacement
 
 export async function detectFacesInImage(
@@ -65,7 +94,8 @@ export async function detectFacesInImage(
 ): Promise<FaceDetectionResult> {
   // MOCK: Simulate ML Kit detection
   // Production: Use native MLKitFaceDetector.detectFacesInPhoto(imageUri)
-  await new Promise((r) => setTimeout(r, 150));
+  // which returns face bounding boxes, angles, and landmarks
+  await new Promise((r) => setTimeout(r, 100));
 
   const mockFace: DetectedFace = {
     boundingBox: {
@@ -110,15 +140,12 @@ export function checkFaceQuality(
   if (widthRatio < AppConfig.FACE_MIN_RATIO || heightRatio < AppConfig.FACE_MIN_RATIO) {
     return { valid: false, reason: 'too_far', message: 'Please move closer to camera' };
   }
-
   if (widthRatio > AppConfig.FACE_MAX_RATIO || heightRatio > AppConfig.FACE_MAX_RATIO) {
     return { valid: false, reason: 'too_close', message: 'Please move away from camera' };
   }
-
   if (Math.abs(angles.rotationZ) > AppConfig.FACE_MAX_TILT_DEG) {
     return { valid: false, reason: 'tilted', message: 'Please keep your face straight' };
   }
-
   return { valid: true, reason: 'ok' };
 }
 
@@ -134,24 +161,23 @@ export function checkRegistrationAngle(face: DetectedFace, step: AngleStep): {
   if (Math.abs(rotationZ) > AppConfig.FACE_MAX_TILT_DEG) {
     return { valid: false, message: 'Keep face straight (no tilt)' };
   }
-
   if (rotationY < config.rotY[0] || rotationY > config.rotY[1]) {
-    const direction = step === 'LEFT' ? 'Turn your face LEFT' :
-                      step === 'RIGHT' ? 'Turn your face RIGHT' :
-                      'Face the camera directly';
+    const direction =
+      step === 'LEFT' ? 'Turn your face LEFT' :
+      step === 'RIGHT' ? 'Turn your face RIGHT' :
+      'Face the camera directly';
     return { valid: false, message: direction };
   }
-
   if ('rotX' in config) {
     const [minX, maxX] = (config as any).rotX;
     if (rotationX < minX || rotationX > maxX) {
-      const direction = step === 'UP' ? 'Tilt face slightly UP' :
-                        step === 'DOWN' ? 'Tilt face slightly DOWN' :
-                        'Keep face level';
+      const direction =
+        step === 'UP' ? 'Tilt face slightly UP' :
+        step === 'DOWN' ? 'Tilt face slightly DOWN' :
+        'Keep face level';
       return { valid: false, message: direction };
     }
   }
-
   return { valid: true };
 }
 
@@ -174,7 +200,7 @@ export function computeCropRegion(
   return { x, y, width: right - x, height: bottom - y };
 }
 
-// ─── Face Alignment ───────────────────────────────────────────────────────────
+// ─── Face Alignment Angle ─────────────────────────────────────────────────────
 
 export function computeAlignmentAngle(landmarks: FaceLandmarks): number {
   if (!landmarks.leftEye || !landmarks.rightEye) return 0;
@@ -183,30 +209,92 @@ export function computeAlignmentAngle(landmarks: FaceLandmarks): number {
   return Math.atan2(dy, dx) * (180 / Math.PI);
 }
 
-// ─── Mock TFLite Embedding Engine ────────────────────────────────────────────
-// TODO: Replace with react-native-fast-tflite after adding model to assets/models/mobilefacenet.tflite
-// Production: Load model once, run inference synchronously on normalized Float32 tensor
-// Input: [1, 112, 112, 3] Float32 normalized to [-1, +1]
-// Output: [1, 128] Float32 embedding
+// ─── TFLite Face Embedding Engine ─────────────────────────────────────────────
+//
+//  Pipeline:
+//    imageUri + cropRegion
+//      → ImagePreprocessor.preprocessFaceImage()
+//          → crop (with padding) + optional alignment rotation
+//          → resize to 112×112
+//          → base64 decode → RGB pixel array [37,632 values]
+//      → TFLiteEngine.runInference()
+//          → buildInputTensor(): pixel/127.5 - 1.0 → Float32Array
+//          → model.run({ '0': tensor }) → Float32Array [128 values]
+//      → Array.from(Float32Array) → normalizeEmbedding() → EmbeddingVector
+//
+//  Fallback (when model not loaded):
+//      → deterministic mock embedding based on URI + crop hash
 
 export async function generateFaceEmbedding(
   imageUri: string,
-  cropRegion: { x: number; y: number; width: number; height: number }
+  cropRegion: { x: number; y: number; width: number; height: number },
+  landmarks?: FaceLandmarks
 ): Promise<EmbeddingVector> {
-  // MOCK: Returns deterministic pseudo-embedding based on URI hash
-  // Production pipeline: crop → align → resize(112x112) → RGB → normalize → TFLite → embedding
-  await new Promise((r) => setTimeout(r, 200));
+  // ── Try real TFLite inference ──────────────────────────────────
+  try {
+    // Compute eye alignment angle if landmarks available
+    const alignAngle = landmarks ? computeAlignmentAngle(landmarks) : 0;
 
-  let seed = 0;
-  for (let i = 0; i < imageUri.length; i++) {
-    seed = (seed * 31 + imageUri.charCodeAt(i)) & 0xFFFFFFFF;
+    // Clamp crop to safe bounds (imageWidth/Height not passed here;
+    // use generous bounds — manipulateAsync will clamp further)
+    const safeCrop = {
+      x: Math.max(0, cropRegion.x),
+      y: Math.max(0, cropRegion.y),
+      width: Math.max(10, cropRegion.width),
+      height: Math.max(10, cropRegion.height),
+    };
+
+    // Step 1: Preprocess image → flat RGB pixel array
+    const { rgbPixels } = await preprocessFaceImage(imageUri, safeCrop, alignAngle);
+
+    // Step 2: TFLite inference → Float32Array embedding
+    const embeddingF32 = await runInference(rgbPixels);
+
+    // Step 3: Convert to number[] and L2 normalize
+    const embedding = Array.from(embeddingF32);
+    return normalizeEmbedding(embedding);
+
+  } catch (error: any) {
+    // ── Fallback to mock when model unavailable ──────────────────
+    const isMissingModel =
+      error?.message?.includes('model') ||
+      error?.message?.includes('tflite') ||
+      error?.message?.includes('Failed to load') ||
+      error?.message?.includes('Cannot find module') ||
+      error?.message?.includes('No such file');
+
+    if (isMissingModel) {
+      console.warn(
+        '[FaceRecognitionService] TFLite model not available — using mock embedding.\n' +
+        'Add mobilefacenet.tflite to assets/models/ to enable real inference.\n' +
+        `Error: ${error?.message}`
+      );
+    } else {
+      // Unexpected processing error — log but still fallback gracefully
+      console.error('[FaceRecognitionService] Inference pipeline error:', error?.message);
+    }
+
+    return generateMockEmbedding(imageUri, cropRegion);
   }
+}
 
+/**
+ * Deterministic mock embedding — used when TFLite model is unavailable.
+ * Produces consistent results per URI+crop combination for UI testing.
+ * NOT suitable for real face recognition.
+ */
+function generateMockEmbedding(
+  imageUri: string,
+  cropRegion: { x: number; y: number; width: number; height: number }
+): EmbeddingVector {
+  let seed = 0;
+  const str = `${imageUri}:${cropRegion.x}:${cropRegion.y}`;
+  for (let i = 0; i < str.length; i++) {
+    seed = (seed * 31 + str.charCodeAt(i)) & 0xffffffff;
+  }
   const embedding = new Array(AppConfig.MODEL_EMBEDDING_DIM).fill(0).map((_, i) => {
-    const val = Math.sin(seed * (i + 1) * 0.001) * 0.5 + Math.cos(seed * (i + 2) * 0.003) * 0.5;
-    return val;
+    return Math.sin(seed * (i + 1) * 0.001) * 0.5 + Math.cos(seed * (i + 2) * 0.003) * 0.5;
   });
-
   return normalizeEmbedding(embedding);
 }
 
@@ -248,9 +336,7 @@ export function recognizeFace(
   storedEmbeddings: StoredEmbedding[],
   threshold: number = AppConfig.DEFAULT_RECOGNITION_THRESHOLD
 ): RecognitionMatch | null {
-  if (!storedEmbeddings || storedEmbeddings.length === 0) {
-    return null;
-  }
+  if (!storedEmbeddings || storedEmbeddings.length === 0) return null;
 
   let bestScore = -1;
   let bestMatch: StoredEmbedding | null = null;

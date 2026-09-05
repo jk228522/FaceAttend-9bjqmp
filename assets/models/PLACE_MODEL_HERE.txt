@@ -1,0 +1,38 @@
+PLACE mobilefacenet.tflite HERE
+══════════════════════════════════════════════════════════════════
+FILE:    assets/models/mobilefacenet.tflite
+PURPOSE: MobileFaceNet face embedding model for TFLite inference
+SIZE:    Typically 2–8 MB depending on variant
+
+HOW TO OBTAIN:
+  Option A — Download pre-trained model:
+    https://github.com/sirius-ai/MobileFaceNet_TF (convert to TFLite)
+    https://github.com/deepinsight/insightface (MobileFaceNet weights)
+    https://github.com/cunjian/pytorch_face_landmark (PyTorch → TFLite)
+
+  Option B — Use facenet-lite:
+    pip install facenet-pytorch
+    # Export to TFLite with input [1,112,112,3] Float32
+
+  Option C — Use OpenFace / ArcFace TFLite variants:
+    https://github.com/deepcam-cn/yolov5-face (companion models)
+
+AFTER PLACING THE MODEL:
+  1. Open app → Settings → "Inspect TFLite Model"
+  2. Verify input shape: [1, 112, 112, 3] Float32
+  3. Verify output shape: [1, 128] Float32 (or update config)
+  4. Update constants/config.ts if shapes differ:
+     - MODEL_INPUT_SIZE
+     - MODEL_INPUT_CHANNELS
+     - MODEL_EMBEDDING_DIM
+     - MODEL_NORMALIZE_MEAN / MODEL_NORMALIZE_SCALE
+  5. If input tensor name is not '0', update TFLiteEngine.ts runInference()
+  6. Calibrate thresholds with same-person vs different-person test scores
+
+PROVISIONAL ASSUMPTIONS (verify before production):
+  Input  : [1, 112, 112, 3]  Float32  normalized to [-1.0, +1.0]
+           (pixel / 127.5 - 1.0)
+  Output : [1, 128]          Float32  raw face embedding
+  L2 normalization applied post-inference in FaceRecognitionService
+
+══════════════════════════════════════════════════════════════════

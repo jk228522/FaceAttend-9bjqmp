@@ -9,6 +9,7 @@ import {
   Switch,
   TextInput,
   ActivityIndicator,
+  Modal,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -19,6 +20,14 @@ import { useAlert } from '@/template';
 import { AppCard } from '@/components/ui/AppCard';
 import { AppButton } from '@/components/ui/AppButton';
 import { getAllSettings, setSetting } from '@/services/DatabaseService';
+import {
+  inspectModelMetadata,
+  formatMetadata,
+  isModelLoaded,
+  loadModel,
+  getModelLoadError,
+  type ModelMetadata,
+} from '@/services/FaceRecognitionService';
 import { AppConfig } from '@/constants/config';
 import { Spacing, FontSize, FontWeight, Radius } from '@/constants/theme';
 
@@ -47,6 +56,10 @@ export default function SettingsScreen() {
   });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [modelInspecting, setModelInspecting] = useState(false);
+  const [modelMeta, setModelMeta] = useState<ModelMetadata | null>(null);
+  const [modelModalVisible, setModelModalVisible] = useState(false);
+  const [modelStatus, setModelStatus] = useState<'unknown' | 'loaded' | 'failed'>('unknown');
 
   useEffect(() => {
     getAllSettings()
@@ -95,6 +108,36 @@ export default function SettingsScreen() {
       setSaving(false);
     }
   }, [settings]);
+
+  const handleInspectModel = useCallback(async () => {
+    setModelInspecting(true);
+    try {
+      const meta = await inspectModelMetadata();
+      setModelMeta(meta);
+      setModelStatus(meta.loaded ? 'loaded' : 'failed');
+      setModelModalVisible(true);
+    } catch (e: any) {
+      setModelMeta({ inputs: [], outputs: [], loaded: false, error: e?.message });
+      setModelStatus('failed');
+      setModelModalVisible(true);
+    } finally {
+      setModelInspecting(false);
+    }
+  }, []);
+
+  const handlePreloadModel = useCallback(async () => {
+    setModelInspecting(true);
+    try {
+      await loadModel();
+      setModelStatus('loaded');
+      showAlert('Model Loaded', 'mobilefacenet.tflite loaded successfully into memory.');
+    } catch (e: any) {
+      setModelStatus('failed');
+      showAlert('Model Load Failed', e?.message ?? 'Could not load TFLite model. Ensure mobilefacenet.tflite exists in assets/models/');
+    } finally {
+      setModelInspecting(false);
+    }
+  }, []);
 
   const handleThemeToggle = useCallback((value: boolean) => {
     updateSetting('dark_mode', value ? 'true' : 'false');
@@ -282,6 +325,54 @@ export default function SettingsScreen() {
           ))}
         </AppCard>
 
+        {/* TFLite Model Inspector */}
+        <Text style={[styles.sectionTitle, { color: colors.textMuted }]}>TFLITE MODEL</Text>
+        <AppCard style={{ marginBottom: Spacing.lg }}>
+          <View style={styles.settingRow}>
+            <MaterialIcons name="memory" size={22} color={colors.primary} />
+            <View style={styles.settingInfo}>
+              <Text style={[styles.settingLabel, { color: colors.textPrimary }]}>mobilefacenet.tflite</Text>
+              <Text style={[styles.settingDesc, { color: colors.textMuted }]}>
+                Status: {
+                  modelStatus === 'loaded' ? '✅ Loaded in memory' :
+                  modelStatus === 'failed' ? '❌ Not loaded / file missing' :
+                  isModelLoaded() ? '✅ Loaded' : '⏳ Not yet loaded'
+                }
+              </Text>
+              <Text style={[styles.settingDesc, { color: colors.textMuted, marginTop: 2 }]}>
+                Path: assets/models/mobilefacenet.tflite
+              </Text>
+            </View>
+          </View>
+
+          <View style={[styles.divider, { backgroundColor: colors.border }]} />
+
+          <View style={[styles.noteBox, { backgroundColor: colors.infoBg, borderColor: colors.info }]}>
+            <MaterialIcons name="info" size={15} color={colors.info} />
+            <Text style={[styles.noteText, { color: colors.info }]}>
+              Place mobilefacenet.tflite in assets/models/ before using real inference.
+              Provisional input: [1,112,112,3] Float32 → output: [1,128] Float32.
+              Verify with Inspect before production.
+            </Text>
+          </View>
+
+          <View style={{ flexDirection: 'row', gap: Spacing.sm, marginTop: Spacing.md }}>
+            <AppButton
+              label={modelInspecting ? 'Loading...' : 'Preload Model'}
+              onPress={handlePreloadModel}
+              loading={modelInspecting}
+              variant="secondary"
+              style={{ flex: 1 }}
+            />
+            <AppButton
+              label={modelInspecting ? 'Inspecting...' : 'Inspect Metadata'}
+              onPress={handleInspectModel}
+              loading={modelInspecting}
+              style={{ flex: 1 }}
+            />
+          </View>
+        </AppCard>
+
         {/* App Info */}
         <AppCard elevated>
           <View style={styles.appInfoRow}>
@@ -296,6 +387,74 @@ export default function SettingsScreen() {
             </View>
           </View>
         </AppCard>
+
+        {/* Model Metadata Modal */}
+        <Modal
+          visible={modelModalVisible}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setModelModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={[styles.modalBox, { backgroundColor: colors.bgCard, borderColor: colors.border }]}>
+              <View style={styles.modalHeader}>
+                <MaterialIcons
+                  name={modelMeta?.loaded ? 'check-circle' : 'error'}
+                  size={22}
+                  color={modelMeta?.loaded ? colors.success : colors.error}
+                />
+                <Text style={[styles.modalTitle, { color: colors.textPrimary }]}>TFLite Model Inspector</Text>
+                <Pressable onPress={() => setModelModalVisible(false)} accessibilityLabel="Close">
+                  <MaterialIcons name="close" size={22} color={colors.textMuted} />
+                </Pressable>
+              </View>
+
+              <ScrollView style={{ maxHeight: 360 }} showsVerticalScrollIndicator={false}>
+                <View style={[styles.metaBox, { backgroundColor: colors.bgSurface, borderColor: colors.border }]}>
+                  <Text style={[styles.metaText, { color: modelMeta?.loaded ? colors.textPrimary : colors.error }]}>
+                    {modelMeta ? formatMetadata(modelMeta) : 'No data'}
+                  </Text>
+                </View>
+
+                {modelMeta?.loaded ? (
+                  <>
+                    <Text style={[styles.settingDesc, { color: colors.textMuted, marginTop: Spacing.md }]}>
+                      ✅ Verify these values match constants/config.ts:
+                    </Text>
+                    {[
+                      `MODEL_INPUT_SIZE: ${AppConfig.MODEL_INPUT_SIZE}`,
+                      `MODEL_INPUT_CHANNELS: ${AppConfig.MODEL_INPUT_CHANNELS}`,
+                      `MODEL_EMBEDDING_DIM: ${AppConfig.MODEL_EMBEDDING_DIM}`,
+                      `Normalize: (pixel - ${AppConfig.MODEL_NORMALIZE_MEAN}) / ${AppConfig.MODEL_NORMALIZE_SCALE}`,
+                    ].map((line) => (
+                      <Text key={line} style={[styles.settingDesc, { color: colors.textSecondary, marginTop: 2 }]}>
+                        • {line}
+                      </Text>
+                    ))}
+                  </>
+                ) : (
+                  <>
+                    <Text style={[styles.settingDesc, { color: colors.warning, marginTop: Spacing.md }]}>
+                      ⚠ Model file missing or incompatible.
+                    </Text>
+                    <Text style={[styles.settingDesc, { color: colors.textMuted, marginTop: 4 }]}>
+                      Copy mobilefacenet.tflite to assets/models/ and rebuild the APK.
+                      The app will use mock embeddings until the model is present.
+                    </Text>
+                  </>
+                )}
+              </ScrollView>
+
+              <AppButton
+                label="Close"
+                onPress={() => setModelModalVisible(false)}
+                fullWidth
+                variant="secondary"
+                style={{ marginTop: Spacing.lg }}
+              />
+            </View>
+          </View>
+        </Modal>
 
         {/* Save Button */}
         <AppButton
@@ -359,4 +518,39 @@ const styles = StyleSheet.create({
     includeFontPadding: false,
   },
   appInfoRow: { flexDirection: 'row', gap: Spacing.md, alignItems: 'flex-start' },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'flex-end',
+  },
+  modalBox: {
+    borderTopLeftRadius: Radius.xl,
+    borderTopRightRadius: Radius.xl,
+    borderWidth: 1,
+    padding: Spacing.lg,
+    paddingBottom: Spacing.xl,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.sm,
+    marginBottom: Spacing.md,
+  },
+  modalTitle: {
+    flex: 1,
+    fontSize: FontSize.md,
+    fontWeight: FontWeight.bold,
+    includeFontPadding: false,
+  },
+  metaBox: {
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    padding: Spacing.md,
+  },
+  metaText: {
+    fontSize: FontSize.xs,
+    fontFamily: 'monospace',
+    lineHeight: 18,
+    includeFontPadding: false,
+  },
 });
